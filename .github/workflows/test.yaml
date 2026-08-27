@@ -1,0 +1,333 @@
+name: multikernel test (Lima)
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      kernel_ref:
+        description: "multikernel/linux ref to build (default: latest non-archive tag)"
+        required: false
+        default: ""
+
+env:
+  VM_NAME: mk
+  VM_CPUS: 4
+  VM_MEMORY_GIB: 8
+  VM_DISK_GIB: 40
+
+jobs:
+  build-kernel:
+    name: Build multikernel kernel (.deb)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 300
+    outputs:
+      kernel_tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Resolve latest multikernel/linux tag
+        id: tag
+        run: |
+          set -euxo pipefail
+          if [ -n "${{ github.event.inputs.kernel_ref }}" ]; then
+            tag="${{ github.event.inputs.kernel_ref }}"
+          else
+            tag=$(git ls-remote --tags --refs https://github.com/multikernel/linux.git \
+              | awk -F/ '{print $NF}' | grep -E '^v[0-9]' | sort -V | tail -n1)
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Building multikernel/linux @ $tag"
+
+      - name: Install build dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev libdw-dev libncurses-dev \
+            dwarves rsync kmod cpio fakeroot dpkg-dev debhelper ccache \
+            python3 git zstd
+
+      - name: Cache ccache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ runner.os }}-${{ steps.tag.outputs.tag }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ steps.tag.outputs.tag }}-
+            ccache-${{ runner.os }}-
+
+      - name: Check out multikernel/linux @ ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 --branch "${{ steps.tag.outputs.tag }}" \
+            https://github.com/multikernel/linux.git linux
+
+      - name: Configure kernel
+        run: |
+          set -euxo pipefail
+          cd linux
+          cp "/boot/config-$(uname -r)" .config
+          # Required by multikernel
+          scripts/config --enable CONFIG_MULTIKERNEL
+          scripts/config --enable CONFIG_MKTTY
+          # Keep the CI build fast and self-contained
+          scripts/config --disable CONFIG_DEBUG_INFO
+          scripts/config --disable CONFIG_DEBUG_INFO_DWARF5
+          scripts/config --disable CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT
+          scripts/config --disable CONFIG_DEBUG_INFO_BTF
+          scripts/config --enable  CONFIG_DEBUG_INFO_NONE
+          scripts/config --disable CONFIG_MODULE_SIG
+          scripts/config --disable CONFIG_MODULE_SIG_ALL
+          scripts/config --set-str CONFIG_SYSTEM_TRUSTED_KEYS ""
+          scripts/config --set-str CONFIG_SYSTEM_REVOCATION_KEYS ""
+          scripts/config --disable CONFIG_MODULE_COMPRESS_XZ
+          scripts/config --disable CONFIG_MODULE_COMPRESS_ZSTD
+          scripts/config --enable  CONFIG_MODULE_COMPRESS_NONE
+          make olddefconfig
+          grep -E '^CONFIG_(MULTIKERNEL|MKTTY)=y' .config || { echo "multikernel options not enabled"; exit 1; }
+
+      - name: Build Debian packages
+        run: |
+          set -euxo pipefail
+          cd linux
+          export CCACHE_DIR=~/.cache/ccache
+          export KBUILD_BUILD_TIMESTAMP="$(git log -1 --format=%cd)"
+          make -j"$(nproc)" CC="ccache gcc" LOCALVERSION=-multikernel bindeb-pkg
+          mkdir -p ../debs
+          mv ../linux-image-*.deb ../linux-headers-*.deb ../debs/
+          ls -l ../debs
+          ccache -s || true
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: kernel-debs
+          path: debs/*.deb
+          if-no-files-found: error
+          retention-days: 7
+
+  vm-test:
+    name: Run multikernel in Lima VM (ubuntu-26.04)
+    needs: build-kernel
+    runs-on: ubuntu-26.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: kernel-debs
+          path: debs
+
+      - uses: lima-vm/lima-actions/setup@v1
+        id: lima-actions-setup
+
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/lima
+          key: lima-${{ steps.lima-actions-setup.outputs.version }}-ubuntu-26.04
+
+      - name: Start Lima VM (plain mode)
+        run: |
+          set -euxo pipefail
+          limactl start --plain --name="$VM_NAME" \
+            --cpus="$VM_CPUS" --memory="$VM_MEMORY_GIB" --disk="$VM_DISK_GIB" \
+            template://ubuntu-26.04
+          limactl list
+          ssh "lima-$VM_NAME" 'uname -a; nproc; free -h; cat /etc/os-release'
+
+      - name: Copy kernel packages into the VM
+        run: rsync -a -e ssh debs "lima-$VM_NAME:/tmp/"
+
+      - name: Install multikernel kernel
+        run: |
+          ssh "lima-$VM_NAME" sudo bash -s <<'EOS'
+          set -euxo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends initramfs-tools kmod
+
+          dpkg -i /tmp/debs/linux-image-*.deb /tmp/debs/linux-headers-*.deb
+
+          KVER=$(dpkg-deb -f /tmp/debs/linux-image-*.deb Package | sed 's/^linux-image-//')
+          echo "Installed kernel: $KVER"
+          test -f "/boot/vmlinuz-$KVER"
+
+          # Make sure the new kernel is what we boot next, even if GRUB's
+          # version sort would prefer the distro kernel.
+          if [ -d /boot/grub ]; then
+            ENTRY=$(grep -oP "gnulinux-advanced-[^']+" /boot/grub/grub.cfg | head -n1 || true)
+            if [ -n "$ENTRY" ]; then
+              DEFAULT="$ENTRY>gnulinux-$KVER-advanced-${ENTRY#gnulinux-advanced-}"
+              mkdir -p /etc/default/grub.d
+              printf 'GRUB_DEFAULT="%s"\nGRUB_TIMEOUT=1\n' "$DEFAULT" > /etc/default/grub.d/99-multikernel.cfg
+              update-grub
+              grub-set-default "$DEFAULT" || true
+            fi
+          fi
+          EOS
+
+      - name: Reboot VM into multikernel kernel
+        run: |
+          set -euxo pipefail
+          ssh "lima-$VM_NAME" 'sudo systemctl reboot' || true
+          for i in $(seq 1 60); do
+            sleep 5
+            if ssh -o ConnectTimeout=5 "lima-$VM_NAME" true 2>/dev/null; then break; fi
+          done
+          ssh "lima-$VM_NAME" 'uname -r | grep -q multikernel'
+          ssh "lima-$VM_NAME" 'uname -a'
+
+      - name: Install Lazy CMA, Kerf and DAXFS
+        run: |
+          ssh "lima-$VM_NAME" sudo bash -s <<'EOS'
+          set -euxo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential git python3 python3-pip python3-venv python3-dev \
+            device-tree-compiler libfdt-dev swig pkg-config pciutils
+
+          KVER=$(uname -r)
+          echo "$KVER" | grep -q multikernel
+          test -d "/lib/modules/$KVER/build"
+
+          cd /opt
+
+          # 1. Lazy CMA
+          rm -rf lazy_cma && git clone --depth 1 https://github.com/multikernel/lazy_cma.git
+          make -C lazy_cma -j"$(nproc)"
+          insmod lazy_cma/lazy_cma.ko
+          test -c /dev/lazy_cma
+
+          # 2. Kerf
+          rm -rf kerf && git clone --depth 1 https://github.com/multikernel/kerf.git
+          python3 -m venv /opt/kerf-venv
+          /opt/kerf-venv/bin/pip install --upgrade pip
+          # pylibfdt builds its SWIG wrapper from source, and swig 4.5 dropped
+          # the PyInt_* macros that wrapper still uses, so build pylibfdt
+          # ourselves with a pinned swig before installing kerf.
+          # https://github.com/multikernel/kerf/blob/v0.2.0/.github/workflows/lint_and_test.yml#L38-L46
+          # setuptools is pinned <81 because rdtsc imports pkg_resources at
+          # runtime, which setuptools 81+ no longer ships.
+          /opt/kerf-venv/bin/pip install "swig<4.5" "setuptools<81" setuptools_scm
+          PATH="/opt/kerf-venv/bin:$PATH" /opt/kerf-venv/bin/pip install --no-build-isolation "pylibfdt>=1.7.0,<2"
+          /opt/kerf-venv/bin/pip install ./kerf
+          ln -sf /opt/kerf-venv/bin/kerf /usr/local/bin/kerf
+          kerf --help
+          kerf init --help
+
+          # 3. DAXFS
+          rm -rf daxfs && git clone --depth 1 https://github.com/multikernel/daxfs.git
+          make -C daxfs -j"$(nproc)"
+          insmod daxfs/daxfs/daxfs.ko
+
+          lsmod | grep -E '^(lazy_cma|daxfs)'
+          dmesg | tail -n 30
+          EOS
+
+      - name: Run kerf functionality test
+        run: |
+          ssh "lima-$VM_NAME" sudo bash -s <<'EOS'
+          set -euxo pipefail
+          INSTANCE=ci-guest
+          KVER=$(uname -r)
+          NCPU=$(nproc)
+          [ "$NCPU" -ge 4 ] || { echo "need >= 4 CPUs, have $NCPU"; exit 1; }
+
+          # Host keeps CPUs 0-1; the pool gets 2..(N-1). One CPU goes to the instance.
+          POOL_CPUS="2-$((NCPU-1))"
+          INST_CPU=$((NCPU-1))
+
+          echo "=== kernel & module sanity"
+          grep -q multikernel <<<"$KVER"
+          test -d /sys/fs/multikernel || mount -t multikernel none /sys/fs/multikernel 2>/dev/null || true
+          ls -la /sys/fs/multikernel
+          test -c /dev/lazy_cma
+          lsmod | grep -q '^daxfs'
+          ls /dev | grep -i mktty || echo "(no mktty device node yet; created on instance boot)"
+
+          cleanup() {
+            set +e
+            echo "=== cleanup"
+            kerf kill "$INSTANCE"
+            kerf unload "$INSTANCE"
+            kerf delete "$INSTANCE"
+            kerf init --cpus=none --memory=none
+            kerf show
+          }
+          trap cleanup EXIT
+
+          echo "=== kerf init"
+          # "kerf init --report" prints the validation report and exits
+          # without applying the baseline, so run the real init separately.
+          kerf init --cpus="$POOL_CPUS" --memory=1GB --report
+          kerf init --cpus="$POOL_CPUS" --memory=1GB
+          kerf show
+          grep -i multikernel /proc/iomem || true
+
+          echo "=== kerf create"
+          kerf create "$INSTANCE" --cpus="$INST_CPU" --memory=512MB
+          kerf show "$INSTANCE"
+          ls /sys/fs/multikernel/instances/
+          kerf dump "$INSTANCE" --dts
+
+          echo "=== kerf load"
+          kerf load "$INSTANCE" \
+            --kernel="/boot/vmlinuz-$KVER" \
+            --initrd="/boot/initrd.img-$KVER" \
+            --cmdline="console=ttyS0 console=mktty0 loglevel=7 rootfstype=ramfs rdinit=/bin/sh"
+          kerf show "$INSTANCE"
+
+          echo "=== kerf exec"
+          kerf exec "$INSTANCE"
+          # Wait for the instance to come up (the guest boots in a few
+          # seconds on KVM, but give slow environments some slack).
+          for i in $(seq 1 24); do
+            sleep 5
+            st=$(cat "/sys/fs/multikernel/instances/$INSTANCE/status")
+            echo "status=$st"
+            [ "$st" = "active" ] && break
+          done
+          kerf show "$INSTANCE"
+          kerf show
+
+          echo "=== verify"
+          # The instance CPU must have left the host.
+          if grep -qw "$INST_CPU" /sys/devices/system/cpu/online; then
+            echo "FAIL: CPU $INST_CPU still online on host after kerf exec"; exit 1
+          fi
+          find /sys/fs/multikernel/instances -maxdepth 2 -type f | while read -r f; do
+            printf '%s: ' "$f"; cat "$f" 2>/dev/null || echo "?"
+          done
+          # No "grep -q": with pipefail it would SIGPIPE kerf on early exit.
+          if kerf show "$INSTANCE" | grep -iE 'running|active|booted'; then
+            echo "PASS: instance $INSTANCE is running"
+          else
+            echo "WARN: could not confirm running state from 'kerf show'; see sysfs dump above"
+          fi
+          dmesg | grep -iE 'multikernel|mktty|kexec' | tail -n 40
+
+          echo "=== kerf kill"
+          kerf kill "$INSTANCE"
+          sleep 5
+          kerf show "$INSTANCE" || true
+          echo "SUCCESS"
+          EOS
+
+      - name: Collect logs
+        if: always()
+        run: |
+          set -x
+          mkdir -p logs
+          ssh "lima-$VM_NAME" 'sudo dmesg' > logs/dmesg.txt || true
+          ssh "lima-$VM_NAME" 'sudo journalctl -b --no-pager' > logs/journal.txt || true
+          ssh "lima-$VM_NAME" 'sudo find /sys/fs/multikernel -type f 2>/dev/null | while read f; do echo "== $f"; cat "$f" 2>/dev/null; done' > logs/sysfs-multikernel.txt || true
+          cp -r ~/.lima/"$VM_NAME"/*.log logs/ 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: vm-logs
+          path: logs/
+
+      - name: Stop VM
+        if: always()
+        run: limactl delete -f "$VM_NAME" || true
