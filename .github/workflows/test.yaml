@@ -183,7 +183,9 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             build-essential git python3 python3-pip python3-venv python3-dev \
-            device-tree-compiler libfdt-dev swig pkg-config pciutils
+            device-tree-compiler libfdt-dev swig pkg-config pciutils \
+            musl-tools busybox-static cpio docker.io
+          systemctl enable --now docker
 
           KVER=$(uname -r)
           echo "$KVER" | grep -q multikernel
@@ -199,6 +201,10 @@ jobs:
 
           # 2. Kerf
           rm -rf kerf && git clone --depth 1 https://github.com/multikernel/kerf.git
+          # Build the guest init binary (musl static) before "pip install":
+          # the wheel only ships src/kerf/data/kerf-init if it exists, and
+          # "kerf load --image" fails without it.
+          make -C kerf
           python3 -m venv /opt/kerf-venv
           /opt/kerf-venv/bin/pip install --upgrade pip
           # pylibfdt builds its SWIG wrapper from source, and swig 4.5 dropped
@@ -210,6 +216,7 @@ jobs:
           /opt/kerf-venv/bin/pip install "swig<4.5" "setuptools<81" setuptools_scm
           PATH="/opt/kerf-venv/bin:$PATH" /opt/kerf-venv/bin/pip install --no-build-isolation "pylibfdt>=1.7.0,<2"
           /opt/kerf-venv/bin/pip install ./kerf
+          /opt/kerf-venv/bin/python -c "from kerf.data import get_init_binary_path as p; assert p().exists(), p()"
           ln -sf /opt/kerf-venv/bin/kerf /usr/local/bin/kerf
           kerf --help
           kerf init --help
@@ -312,6 +319,118 @@ jobs:
           echo "SUCCESS"
           EOS
 
+      - name: Run kerf Docker image test (nginx)
+        run: |
+          ssh "lima-$VM_NAME" sudo bash -s <<'EOS'
+          set -euxo pipefail
+          INSTANCE=nginx-demo
+          KVER=$(uname -r)
+          NCPU=$(nproc)
+          POOL_CPUS="2-$((NCPU-1))"
+          INST_CPU=$((NCPU-1))
+
+          docker pull nginx:latest
+
+          # The CI kernel builds daxfs as an out-of-tree module, so boot the
+          # guest with a minimal initramfs that loads daxfs.ko, mounts the
+          # daxfs image from the rootflags= physical address and
+          # switch_roots into it (the module case from "kerf load --help").
+          W=/root/mk-initrd
+          rm -rf "$W"; mkdir -p "$W/bin" "$W/dev" "$W/proc" "$W/sys" "$W/newroot"
+          cp /usr/bin/busybox "$W/bin/busybox"
+          cp /opt/daxfs/daxfs/daxfs.ko "$W/daxfs.ko"
+          mknod "$W/dev/console" c 5 1
+          cat > "$W/init" <<'EOF'
+          #!/bin/busybox sh
+          /bin/busybox mount -t proc proc /proc
+          rootflags=
+          for w in $(/bin/busybox cat /proc/cmdline); do
+            case "$w" in rootflags=*) rootflags="${w#rootflags=}" ;; esac
+          done
+          /bin/busybox insmod /daxfs.ko
+          /bin/busybox mount -t daxfs -o "$rootflags" none /newroot
+          # Bring loopback up so the guest can reach its own sockets.
+          /bin/busybox ip link set lo up
+          /bin/busybox umount /proc
+          exec /bin/busybox switch_root /newroot /init
+          EOF
+          chmod +x "$W/init"
+          (cd "$W" && find . | cpio -o -H newc | gzip -1 > /root/daxfs-initrd.img)
+
+          # Console reader: write the instance id to /dev/mktty, then
+          # stream the guest console to a file (same protocol as
+          # "kerf console", but non-interactive).
+          cat > /root/mktty-dump.py <<'EOF'
+          import os, select, sys, time
+          fd = os.open("/dev/mktty", os.O_RDWR)
+          os.write(fd, (sys.argv[1] + "\n").encode())
+          end = time.time() + float(sys.argv[2])
+          out = open(sys.argv[3], "wb", buffering=0)
+          while time.time() < end:
+              r, _, _ = select.select([fd], [], [], 0.5)
+              if r:
+                  d = os.read(fd, 65536)
+                  if not d:
+                      break
+                  out.write(d)
+          os.close(fd)
+          EOF
+
+          cleanup() {
+            set +e
+            echo "=== cleanup"
+            kerf kill "$INSTANCE"
+            kerf unload "$INSTANCE"
+            kerf delete "$INSTANCE"
+            kerf init --cpus=none --memory=none
+            kerf show
+          }
+          trap cleanup EXIT
+
+          echo "=== kerf init"
+          kerf init --cpus="$POOL_CPUS" --memory=2GB
+          kerf show
+
+          echo "=== kerf create"
+          kerf create "$INSTANCE" --cpus="$INST_CPU" --memory=1GB
+          INST_ID=$(/opt/kerf-venv/bin/python -c "from kerf.utils import get_instance_id_from_name; print(get_instance_id_from_name('$INSTANCE'))")
+          echo "instance id: $INST_ID"
+
+          echo "=== kerf load (Docker image as daxfs rootfs)"
+          # nginx's port is not reachable from the host: this kernel has no
+          # inter-kernel network device, so the guest only has "lo". Verify
+          # nginx serves by fetching over loopback from inside the guest
+          # (bash /dev/tcp) and watching the mktty console from the host.
+          kerf load "$INSTANCE" \
+            --kernel="/boot/vmlinuz-$KVER" \
+            --initrd=/root/daxfs-initrd.img \
+            --image=nginx:latest \
+            --entrypoint="/bin/bash -c 'echo NETDEVS:; ls /sys/class/net; nginx; sleep 3; exec 3<>/dev/tcp/127.0.0.1/80; echo GET / >&3; cat <&3; sleep infinity'" \
+            --cmdline="loglevel=7" \
+            --console=mktty0 \
+            --verbose
+
+          echo "=== kerf exec"
+          python3 /root/mktty-dump.py "$INST_ID" 240 /root/console.log &
+          DUMP_PID=$!
+          kerf exec "$INSTANCE"
+          for i in $(seq 1 24); do
+            sleep 5
+            st=$(cat "/sys/fs/multikernel/instances/$INSTANCE/status")
+            echo "status=$st"
+            [ "$st" = "active" ] && grep -q "Welcome to nginx" /root/console.log && break
+          done
+          kerf show "$INSTANCE"
+
+          echo "=== guest console"
+          kill "$DUMP_PID" 2>/dev/null || true
+          wait "$DUMP_PID" 2>/dev/null || true
+          cat /root/console.log
+          grep -q "Welcome to nginx" /root/console.log
+          echo "PASS: nginx served HTTP on 127.0.0.1:80 inside the spawn kernel"
+          echo "SUCCESS"
+          EOS
+
       - name: Collect logs
         if: always()
         run: |
@@ -319,6 +438,7 @@ jobs:
           mkdir -p logs
           ssh "lima-$VM_NAME" 'sudo dmesg' > logs/dmesg.txt || true
           ssh "lima-$VM_NAME" 'sudo journalctl -b --no-pager' > logs/journal.txt || true
+          ssh "lima-$VM_NAME" 'sudo cat /root/console.log' > logs/nginx-console.txt || true
           ssh "lima-$VM_NAME" 'sudo find /sys/fs/multikernel -type f 2>/dev/null | while read f; do echo "== $f"; cat "$f" 2>/dev/null; done' > logs/sysfs-multikernel.txt || true
           cp -r ~/.lima/"$VM_NAME"/*.log logs/ 2>/dev/null || true
 
