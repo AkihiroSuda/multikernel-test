@@ -158,12 +158,19 @@ jobs:
 
           # Make sure the new kernel is what we boot next, even if GRUB's
           # version sort would prefer the distro kernel.
+          #
+          # movablecore= reserves a ZONE_MOVABLE region, which the multikernel
+          # pool allocator tries first. Unmovable kernel allocations never land
+          # there, so "kerf init --memory=2GB" can always find contiguous memory.
+          # Since v7.0-mk3 that allocation fails with ENOMEM in ZONE_NORMAL
+          # after the first test returns its pool.
           if [ -d /boot/grub ]; then
             ENTRY=$(grep -oP "gnulinux-advanced-[^']+" /boot/grub/grub.cfg | head -n1 || true)
             if [ -n "$ENTRY" ]; then
               DEFAULT="$ENTRY>gnulinux-$KVER-advanced-${ENTRY#gnulinux-advanced-}"
               mkdir -p /etc/default/grub.d
-              printf 'GRUB_DEFAULT="%s"\nGRUB_TIMEOUT=1\n' "$DEFAULT" > /etc/default/grub.d/99-multikernel.cfg
+              printf 'GRUB_DEFAULT="%s"\nGRUB_TIMEOUT=1\nGRUB_CMDLINE_LINUX="$GRUB_CMDLINE_LINUX movablecore=4G"\n' "$DEFAULT" > /etc/default/grub.d/99-multikernel.cfg
+              cat /etc/default/grub.d/99-multikernel.cfg
               update-grub
               grub-set-default "$DEFAULT" || true
             fi
@@ -180,6 +187,8 @@ jobs:
           done
           ssh "lima-$VM_NAME" 'uname -r | grep -q multikernel'
           ssh "lima-$VM_NAME" 'uname -a'
+          ssh "lima-$VM_NAME" 'cat /proc/cmdline; grep -qw "movablecore=4G" /proc/cmdline'
+          ssh "lima-$VM_NAME" 'grep -A3 "^Node 0, zone *Movable" /proc/zoneinfo' || true
 
       - name: Install Lazy CMA, Kerf and DAXFS
         run: |
@@ -443,6 +452,7 @@ jobs:
           set -x
           mkdir -p logs
           ssh "lima-$VM_NAME" 'sudo dmesg' > logs/dmesg.txt || true
+          ssh "lima-$VM_NAME" 'sudo cat /proc/buddyinfo /proc/pagetypeinfo /proc/zoneinfo' > logs/meminfo.txt || true
           ssh "lima-$VM_NAME" 'sudo journalctl -b --no-pager' > logs/journal.txt || true
           ssh "lima-$VM_NAME" 'sudo cat /root/console.log' > logs/nginx-console.txt || true
           ssh "lima-$VM_NAME" 'sudo find /sys/fs/multikernel -type f 2>/dev/null | while read f; do echo "== $f"; cat "$f" 2>/dev/null; done' > logs/sysfs-multikernel.txt || true
