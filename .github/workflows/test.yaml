@@ -289,8 +289,8 @@ jobs:
             --cmdline="console=ttyS0 console=mktty0 loglevel=7 rootfstype=ramfs rdinit=/bin/sh"
           kerf show "$INSTANCE"
 
-          echo "=== kerf exec"
-          kerf exec "$INSTANCE"
+          echo "=== kerf start"
+          kerf start "$INSTANCE"
           # Wait for the instance to come up (the guest boots in a few
           # seconds on KVM, but give slow environments some slack).
           for i in $(seq 1 24); do
@@ -305,7 +305,7 @@ jobs:
           echo "=== verify"
           # The instance CPU must have left the host.
           if grep -qw "$INST_CPU" /sys/devices/system/cpu/online; then
-            echo "FAIL: CPU $INST_CPU still online on host after kerf exec"; exit 1
+            echo "FAIL: CPU $INST_CPU still online on host after kerf start"; exit 1
           fi
           find /sys/fs/multikernel/instances -maxdepth 2 -type f | while read -r f; do
             printf '%s: ' "$f"; cat "$f" 2>/dev/null || echo "?"
@@ -416,10 +416,10 @@ jobs:
             --console=mktty0 \
             --verbose
 
-          echo "=== kerf exec"
+          echo "=== kerf start"
           python3 /root/mktty-dump.py "$INST_ID" 240 /root/console.log &
           DUMP_PID=$!
-          kerf exec "$INSTANCE"
+          kerf start "$INSTANCE"
           for i in $(seq 1 24); do
             sleep 5
             st=$(cat "/sys/fs/multikernel/instances/$INSTANCE/status")
