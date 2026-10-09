@@ -70,6 +70,10 @@ jobs:
           # Required by multikernel
           scripts/config --enable CONFIG_MULTIKERNEL
           scripts/config --enable CONFIG_MKTTY
+          # Since v7.0-mk3, the spawn kernel parses its manifest from the boot
+          # device tree (initial_boot_params), which needs CONFIG_OF_EARLY_FLATTREE.
+          # CONFIG_MULTIKERNEL does not select it, and Ubuntu's x86 config has CONFIG_OF off.
+          scripts/config --enable CONFIG_OF
           # Keep the CI build fast and self-contained
           scripts/config --disable CONFIG_DEBUG_INFO
           scripts/config --disable CONFIG_DEBUG_INFO_DWARF5
@@ -84,7 +88,9 @@ jobs:
           scripts/config --disable CONFIG_MODULE_COMPRESS_ZSTD
           scripts/config --enable  CONFIG_MODULE_COMPRESS_NONE
           make olddefconfig
-          grep -E '^CONFIG_(MULTIKERNEL|MKTTY)=y' .config || { echo "multikernel options not enabled"; exit 1; }
+          for opt in MULTIKERNEL MKTTY OF OF_EARLY_FLATTREE; do
+            grep -E "^CONFIG_${opt}=y" .config || { echo "CONFIG_${opt} not enabled"; exit 1; }
+          done
 
       - name: Build Debian packages
         run: |
