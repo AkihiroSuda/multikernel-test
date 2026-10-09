@@ -70,6 +70,10 @@ jobs:
           # Required by multikernel
           scripts/config --enable CONFIG_MULTIKERNEL
           scripts/config --enable CONFIG_MKTTY
+          # Since v7.0-mk3, the spawn kernel parses its manifest from the boot
+          # device tree (initial_boot_params), which needs CONFIG_OF_EARLY_FLATTREE.
+          # CONFIG_MULTIKERNEL does not select it, and Ubuntu's x86 config has CONFIG_OF off.
+          scripts/config --enable CONFIG_OF
           # Keep the CI build fast and self-contained
           scripts/config --disable CONFIG_DEBUG_INFO
           scripts/config --disable CONFIG_DEBUG_INFO_DWARF5
@@ -84,7 +88,9 @@ jobs:
           scripts/config --disable CONFIG_MODULE_COMPRESS_ZSTD
           scripts/config --enable  CONFIG_MODULE_COMPRESS_NONE
           make olddefconfig
-          grep -E '^CONFIG_(MULTIKERNEL|MKTTY)=y' .config || { echo "multikernel options not enabled"; exit 1; }
+          for opt in MULTIKERNEL MKTTY OF OF_EARLY_FLATTREE; do
+            grep -E "^CONFIG_${opt}=y" .config || { echo "CONFIG_${opt} not enabled"; exit 1; }
+          done
 
       - name: Build Debian packages
         run: |
@@ -152,12 +158,19 @@ jobs:
 
           # Make sure the new kernel is what we boot next, even if GRUB's
           # version sort would prefer the distro kernel.
+          #
+          # movablecore= reserves a ZONE_MOVABLE region, which the multikernel
+          # pool allocator tries first. Unmovable kernel allocations never land
+          # there, so "kerf init --memory=2GB" can always find contiguous memory.
+          # Since v7.0-mk3 that allocation fails with ENOMEM in ZONE_NORMAL
+          # after the first test returns its pool.
           if [ -d /boot/grub ]; then
             ENTRY=$(grep -oP "gnulinux-advanced-[^']+" /boot/grub/grub.cfg | head -n1 || true)
             if [ -n "$ENTRY" ]; then
               DEFAULT="$ENTRY>gnulinux-$KVER-advanced-${ENTRY#gnulinux-advanced-}"
               mkdir -p /etc/default/grub.d
-              printf 'GRUB_DEFAULT="%s"\nGRUB_TIMEOUT=1\n' "$DEFAULT" > /etc/default/grub.d/99-multikernel.cfg
+              printf 'GRUB_DEFAULT="%s"\nGRUB_TIMEOUT=1\nGRUB_CMDLINE_LINUX="$GRUB_CMDLINE_LINUX movablecore=4G"\n' "$DEFAULT" > /etc/default/grub.d/99-multikernel.cfg
+              cat /etc/default/grub.d/99-multikernel.cfg
               update-grub
               grub-set-default "$DEFAULT" || true
             fi
@@ -174,6 +187,8 @@ jobs:
           done
           ssh "lima-$VM_NAME" 'uname -r | grep -q multikernel'
           ssh "lima-$VM_NAME" 'uname -a'
+          ssh "lima-$VM_NAME" 'cat /proc/cmdline; grep -qw "movablecore=4G" /proc/cmdline'
+          ssh "lima-$VM_NAME" 'grep -A3 "^Node 0, zone *Movable" /proc/zoneinfo' || true
 
       - name: Install Lazy CMA, Kerf and DAXFS
         run: |
@@ -283,8 +298,8 @@ jobs:
             --cmdline="console=ttyS0 console=mktty0 loglevel=7 rootfstype=ramfs rdinit=/bin/sh"
           kerf show "$INSTANCE"
 
-          echo "=== kerf exec"
-          kerf exec "$INSTANCE"
+          echo "=== kerf start"
+          kerf start "$INSTANCE"
           # Wait for the instance to come up (the guest boots in a few
           # seconds on KVM, but give slow environments some slack).
           for i in $(seq 1 24); do
@@ -299,7 +314,7 @@ jobs:
           echo "=== verify"
           # The instance CPU must have left the host.
           if grep -qw "$INST_CPU" /sys/devices/system/cpu/online; then
-            echo "FAIL: CPU $INST_CPU still online on host after kerf exec"; exit 1
+            echo "FAIL: CPU $INST_CPU still online on host after kerf start"; exit 1
           fi
           find /sys/fs/multikernel/instances -maxdepth 2 -type f | while read -r f; do
             printf '%s: ' "$f"; cat "$f" 2>/dev/null || echo "?"
@@ -410,10 +425,10 @@ jobs:
             --console=mktty0 \
             --verbose
 
-          echo "=== kerf exec"
+          echo "=== kerf start"
           python3 /root/mktty-dump.py "$INST_ID" 240 /root/console.log &
           DUMP_PID=$!
-          kerf exec "$INSTANCE"
+          kerf start "$INSTANCE"
           for i in $(seq 1 24); do
             sleep 5
             st=$(cat "/sys/fs/multikernel/instances/$INSTANCE/status")
@@ -437,6 +452,7 @@ jobs:
           set -x
           mkdir -p logs
           ssh "lima-$VM_NAME" 'sudo dmesg' > logs/dmesg.txt || true
+          ssh "lima-$VM_NAME" 'sudo cat /proc/buddyinfo /proc/pagetypeinfo /proc/zoneinfo' > logs/meminfo.txt || true
           ssh "lima-$VM_NAME" 'sudo journalctl -b --no-pager' > logs/journal.txt || true
           ssh "lima-$VM_NAME" 'sudo cat /root/console.log' > logs/nginx-console.txt || true
           ssh "lima-$VM_NAME" 'sudo find /sys/fs/multikernel -type f 2>/dev/null | while read f; do echo "== $f"; cat "$f" 2>/dev/null; done' > logs/sysfs-multikernel.txt || true
